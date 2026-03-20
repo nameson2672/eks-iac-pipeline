@@ -1,0 +1,47 @@
+FROM mcr.microsoft.com/devcontainers/base:ubuntu
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Base tools
+RUN apt-get update && apt-get install -y \
+  curl unzip git jq bash-completion \
+  ca-certificates gnupg lsb-release \
+  && rm -rf /var/lib/apt/lists/*
+
+# Terraform — HashiCorp apt repo supports arm64
+RUN curl -fsSL https://apt.releases.hashicorp.com/gpg \
+  | gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg && \
+  echo "deb [signed-by=/usr/share/keyrings/hashicorp.gpg] \
+  https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+  > /etc/apt/sources.list.d/hashicorp.list && \
+  apt-get update && apt-get install -y terraform && \
+  rm -rf /var/lib/apt/lists/*
+
+# AWS CLI v2 — detect arch at build time (handles both arm64 + amd64)
+RUN ARCH=$(uname -m) && \
+  if [ "$ARCH" = "aarch64" ]; then AWS_ARCH="aarch64"; else AWS_ARCH="x86_64"; fi && \
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${AWS_ARCH}.zip" \
+  -o "awscliv2.zip" && \
+  unzip awscliv2.zip && ./aws/install && \
+  rm -rf aws awscliv2.zip
+
+# kubectl — detect arch at build time
+RUN ARCH=$(uname -m) && \
+  if [ "$ARCH" = "aarch64" ]; then KARCH="arm64"; else KARCH="amd64"; fi && \
+  curl -fsSL \
+  "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/${KARCH}/kubectl" \
+  -o kubectl && \
+  install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl && \
+  rm kubectl
+
+# Helm — install script auto-detects arch
+RUN curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# eksctl — detect arch at build time
+RUN ARCH=$(uname -m) && \
+  if [ "$ARCH" = "aarch64" ]; then EARCH="arm64"; else EARCH="amd64"; fi && \
+  curl --silent --location \
+  "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_Linux_${EARCH}.tar.gz" \
+  | tar xz -C /tmp && \
+  mv /tmp/eksctl /usr/local/bin/eksctl && \
+  chmod +x /usr/local/bin/eksctl
