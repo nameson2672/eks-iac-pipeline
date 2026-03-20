@@ -1,7 +1,20 @@
 module "eks" {
   source = "./modules/eks"
 
-  project_name = var.project_name
-  env         = var.env
+}
 
+module "vpc" {
+  source = "./modules/vpc"
+
+  name = var.project_name
+  vpc_cidr = "10.0.0.0/16"
+  availability_zones = [var.aws_subnet-1, var.aws_subnet-2]
+  public_subnet_cidrs = [var.public_subnet_cidr_1, var.public_subnet_cidr_2]
+  private_subnet_cidrs = [var.private_subnet_cidr_1, var.private_subnet_cidr_2]
+  enable_nat_gateway = var.enable_nat_gateway
+  map_public_ip_on_launch = var.map_public_ip_on_lunch
+  tags = {
+    Environment = var.env
+    Project     = var.project_name
+  }
 }
