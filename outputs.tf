@@ -1,6 +1,3 @@
-# Root-level outputs — surface the most commonly needed values after apply.
-# Run `terraform output` to retrieve these without re-reading state.
-
 output "cluster_name" {
   description = "Name of the EKS cluster."
   value       = module.eks.cluster_name

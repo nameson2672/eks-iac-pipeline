@@ -2,9 +2,6 @@ module "eks" {
   source = "./modules/eks"
   name   = var.project_name
   vpc_id = module.vpc.vpc_id
-
-  # Use the list output — private_subnet_ids returns a map(string) which is
-  # incompatible with the list(string) type expected by the EKS module.
   subnet_ids = module.vpc.private_subnet_ids_list
 
   cluster_version           = "1.30"
