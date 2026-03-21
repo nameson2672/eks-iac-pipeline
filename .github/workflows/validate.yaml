@@ -1,62 +1,140 @@
-name: 'eks-terrafrom-plan'
+name: 'Terraform CI — fmt / validate / plan'
 
+# Run quality gates on every push to any branch and every PR.
+# The PR-comment step only fires on pull_request events.
 on:
   push:
-    branches:
-      - '**'
-
-
-env:
-  AWS_REGION: us-east-1
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    branches: ['**']
+  pull_request:
+    branches: ['**']
 
 permissions:
   contents: read
+  pull-requests: write  # required to post the plan as a PR comment
+
+env:
+  AWS_REGION: ca-central-1
 
 jobs:
   terraform:
-    name: Terraform Plan
+    name: 'Terraform Plan'
     runs-on: ubuntu-latest
-    environment: production
+    # No 'environment: production' here — a protection-gated environment would
+    # block CI from running automatically on every push/PR.
 
     defaults:
       run:
         shell: bash
-        working-directory: eks
+        # The repo root IS the Terraform root (main.tf lives here, not in /eks).
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.9.3
-          terraform_wrapper: true
+          terraform_version: 1.12.0
+          terraform_wrapper: true     
 
-      - name: Cache Terraform
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # The plugin cache directory must exist before the cache action tries to restore into it.
+      - name: Configure Terraform plugin cache
+        run: mkdir -p ~/.terraform.d/plugin-cache
+
+      - name: Cache Terraform providers
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.terraform.d/plugin-cache
-            .terraform
-          key: ${{ runner.os }}-terraform-${{ hashFiles('**/*.tf') }}
+          path: ~/.terraform.d/plugin-cache
+          # Key on the lock file — provider binaries only change when it changes.
+          key: ${{ runner.os }}-terraform-${{ hashFiles('**/.terraform.lock.hcl') }}
           restore-keys: |
             ${{ runner.os }}-terraform-
 
       - name: Terraform Init
-        run: terraform init
+        run: terraform init -input=false
 
+      # Hard fail if any file is not canonical terraform fmt output.
       - name: Terraform Format Check
-        run: terraform fmt -check -diff
-        continue-on-error: false
+        run: terraform fmt -check -diff -recursive
 
+      # Type-checks the configuration without making any AWS API calls.
       - name: Terraform Validate
         run: terraform validate
-        continue-on-error: false
 
-      - name: Terraform plan
+      # continue-on-error: true so the comment step still runs on plan failure.
+      # tee writes to plan.txt AND stdout at the same time.
+      # ${PIPESTATUS[0]} preserves terraform's exit code through the pipe
+      # (tee always exits 0, which would silently hide a failing plan).
+      - name: Terraform Plan
+        id: plan
         run: |
-          terraform plan -var-file=dev.tfvars -input=false
-        continue-on-error: false
+          terraform plan \
+            -var-file=dev.tfvars \
+            -input=false \
+            -no-color \
+            2>&1 | tee plan.txt
+          exit ${PIPESTATUS[0]}
+        continue-on-error: true
+
+      # Post the plan output as a comment on the PR.
+      # Deletes any previous bot plan comment first to avoid stacking on each push.
+      # Truncates output at 65 000 chars (GitHub comment limit is ~65 535).
+      - name: Post Plan as PR Comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const MAX = 65000;
+            let plan = fs.readFileSync('plan.txt', 'utf8');
+            if (plan.length > MAX) {
+              plan = plan.substring(0, MAX) + '\n\n... output truncated (> 65 000 chars) ...';
+            }
+            const status = '${{ steps.plan.outcome }}' === 'success'
+              ? 'Plan succeeded'
+              : 'Plan failed';
+            const body = [
+              `## Terraform Plan — ${status}`,
+              `**Commit:** \`${{ github.sha }}\``,
+              '```',
+              plan,
+              '```',
+            ].join('\n');
+
+            // Delete any previous bot plan comment so we don't stack across commits.
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            for (const c of comments) {
+              if (c.user.type === 'Bot' && c.body.startsWith('## Terraform Plan')) {
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: c.id,
+                });
+              }
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      # Fail the job if the plan step failed.
+      # Placed after the comment step so the comment always posts,
+      # but the overall job still shows red in GitHub.
+      - name: Fail if plan failed
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
