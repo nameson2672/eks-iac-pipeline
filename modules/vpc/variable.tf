@@ -8,6 +8,11 @@ variable "name" {
   }
 }
 
+variable "cluster_name" {
+  description = "Name of the EKS cluster. Used to tag subnets so that EKS and the AWS Load Balancer Controller can discover them."
+  type        = string
+}
+
 variable "vpc_cidr" {
   description = "The IPv4 CIDR block for the VPC (e.g. \"10.0.0.0/16\")."
   type        = string

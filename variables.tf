@@ -12,4 +12,4 @@ variable "public_subnet_cidr_2" {}
 variable "private_subnet_cidr_1" {}
 variable "private_subnet_cidr_2" {}
 variable "enable_nat_gateway" {}
-variable "map_public_ip_on_lunch" {}
+variable "map_public_ip_on_launch" {}
