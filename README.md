@@ -1,243 +1,386 @@
 # EKS IaC Pipeline
 
-> Automated provisioning of a production-ready Amazon EKS cluster on AWS using Terraform — from VPC to running nodes in a single `terraform apply`.
+> Fully automated, production-pattern Amazon EKS cluster provisioned with Terraform — custom VPC, private worker nodes, remote state, and a CI pipeline that validates every change before it can be applied.
+
+---
+![diagram](https://github.com/nameson2672/eks-iac-pipeline/blob/main/public/diagram.png?raw=true)
 
 ## Overview
 
-This project provisions a fully functional Kubernetes cluster on AWS using modular, reusable Terraform. It is designed to reflect the kind of infrastructure automation used in real production environments — remote state, least-privilege IAM, private node networking, and a CI pipeline that validates every change before it lands.
+This project automates the end-to-end provisioning of a Kubernetes cluster on AWS. It is structured to match real-world practices: infrastructure is split into reusable modules, state is stored remotely with locking, every pull request runs a full `terraform plan` and surfaces the result as a comment, and no one can apply to production without passing through CI first.
 
-**What gets built:**
+**Resources provisioned by a single `terraform apply`:**
 
-- A custom VPC with public and private subnets across two availability zones
-- A NAT Gateway so private nodes can reach the internet without being exposed
-- An EKS control plane with a managed node group running in the private subnets
-- All required IAM roles, policies, and an OIDC provider for workload identity (IRSA)
-- Security groups with minimal, explicit ingress/egress rules
-- Remote Terraform state in S3 with DynamoDB locking
-- A GitHub Actions CI pipeline that runs `fmt → validate → plan` on every push and PR
-
----
-
-## Architecture
-
-<!-- ------------------------------------------------------------------ -->
-<!-- ARCHITECTURE DIAGRAM                                                  -->
-<!-- Replace this comment block with your diagram image once created.     -->
-<!--                                                                      -->
-<!-- Recommended tools:                                                    -->
-<!--   - draw.io (diagrams.net) — free, exports PNG/SVG                  -->
-<!--   - Lucidchart                                                        -->
-<!--   - AWS Architecture Icons (official icon set)                       -->
-<!--                                                                      -->
-<!-- Suggested diagram elements:                                           -->
-<!--   GitHub -> GitHub Actions -> S3 (Terraform state)                  -->
-<!--   VPC                                                                 -->
-<!--     +-- Public Subnet AZ-a  ->  NAT Gateway                         -->
-<!--     +-- Public Subnet AZ-b                                            -->
-<!--     +-- Private Subnet AZ-a  ->  Worker Node (t3.medium)            -->
-<!--     +-- Private Subnet AZ-b  ->  Worker Node (t3.medium)            -->
-<!--   EKS Control Plane (managed by AWS)                                 -->
-<!--   IAM Roles (cluster role, node role, OIDC provider)                 -->
-<!-- ------------------------------------------------------------------ -->
-
-```text
-[ Architecture diagram coming soon ]
-```
-
-> **Note:** Save your diagram as `docs/architecture.png` and replace the placeholder above with:
-> `![Architecture](docs/architecture.png)`
+- **VPC** — `10.0.0.0/16` with two public subnets and two private subnets across two availability zones
+- **Internet Gateway** — attached to the VPC for public-subnet egress
+- **NAT Gateway** — sits in the first public subnet; all worker node outbound traffic routes through it
+- **Route tables** — public routes to the IGW, private routes to the NAT Gateway
+- **EKS control plane** — Kubernetes 1.30, hosted and managed by AWS
+- **Managed node group** — `t3.medium` EC2 instances running in the private subnets, autoscaling 1–3 nodes
+- **IAM roles** — cluster role (trusts `eks.amazonaws.com`) and node role (trusts `ec2.amazonaws.com`) with minimum required policies
+- **OIDC provider** — registered at cluster creation so workloads can assume IAM roles immediately (IRSA)
+- **Security groups** — explicit ingress/egress rules between the control plane and nodes
+- **S3 + DynamoDB** — remote state backend with encryption and concurrency locking
 
 ---
 
-## Stack
 
-| Layer | Technology |
-| --- | --- |
-| Infrastructure as Code | Terraform >= 1.14.7 |
-| Cloud provider | AWS (ca-central-1) |
-| Container orchestration | Amazon EKS 1.30 |
-| Networking | Custom VPC, public/private subnets, NAT Gateway |
-| Node compute | EC2 t3.medium (managed node group) |
-| State management | S3 + DynamoDB state lock |
-| CI/CD | GitHub Actions |
-| Workload identity | OIDC provider (IRSA-ready) |
+### Networking rules
 
----
-
-## Project Structure
-
-```text
-eks-iac-pipeline/
-├── main.tf                   # Root module — wires VPC and EKS together
-├── variables.tf              # Input variable declarations
-├── outputs.tf                # Root-level outputs (endpoint, IDs, OIDC ARN)
-├── provider.tf               # AWS + TLS provider config
-├── backend.tf                # S3 remote state + DynamoDB lock
-├── dev.tfvars                # Dev environment variable values
-│
-├── modules/
-│   ├── vpc/                  # Reusable VPC module
-│   │   ├── main.tf           # VPC, subnets, IGW, NAT, route tables
-│   │   ├── variable.tf
-│   │   └── output.tf
-│   │
-│   └── eks/                  # Reusable EKS module
-│       ├── main.tf           # Cluster, node group, IAM, SGs, OIDC
-│       ├── variable.tf
-│       └── output.tf
-│
-└── .github/
-    └── workflows/
-        ├── validate.yaml     # CI: fmt + validate + plan on push/PR
-        └── terraform.yml     # Manual: plan / apply / destroy
-```
-
----
-
-## How It Works
-
-### 1. VPC Module
-
-A dedicated VPC (`10.0.0.0/16`) is created with two public and two private subnets spread across two availability zones. The public subnets host the NAT Gateway; all worker nodes run in the private subnets and reach the internet through it. Route tables and subnet tags (`kubernetes.io/role/elb`, `kubernetes.io/role/internal-elb`) are applied so the AWS Load Balancer Controller can discover subnets automatically.
-
-### 2. EKS Module
-
-The EKS control plane is placed inside the VPC using private subnets. Two security groups are created with explicit rules:
-
-- **Cluster SG** — accepts port 443 from nodes, allows all egress
-- **Node SG** — node-to-node unrestricted, accepts port 10250 and ephemeral ports from the control plane
-
-A managed node group runs `t3.medium` instances (`ON_DEMAND`) with autoscaling configured between 1 and 3 nodes. IAM roles are created for both the control plane and worker nodes with the minimum required AWS managed policies. An OIDC provider is registered so that Kubernetes service accounts can assume IAM roles (IRSA) — a requirement for add-ons like the AWS Load Balancer Controller, Cluster Autoscaler, and external-dns.
-
-### 3. State Management
-
-Terraform state is stored remotely in an S3 bucket (`eks-iac-tf-state`) with server-side encryption enabled. A DynamoDB table (`terraform-state-lock`) prevents concurrent apply operations from corrupting state.
-
-### 4. CI Pipeline
-
-Every commit to any branch and every pull request triggers the `validate.yaml` workflow:
-
-```text
-push / pull_request
-       |
-       v
-terraform init       <- connects to S3 backend
-       |
-terraform fmt -check <- fails if formatting is off
-       |
-terraform validate   <- type-checks config (no AWS calls)
-       |
-terraform plan       <- full plan against real AWS state
-       |
-       v (on PR only)
-Post plan as PR comment
-```
-
-On PRs, the full plan output is posted as a comment so reviewers can see exactly what will change before merging.
-
-The `terraform.yml` workflow is triggered manually from the GitHub Actions UI and is the only way to run `apply` or `destroy` from CI. It uses a `production` environment so GitHub's protection rules apply before any destructive operation runs.
+| Traffic | From | To | Port |
+| --- | --- | --- | --- |
+| API server access | Worker nodes | Control plane | 443 |
+| Kubelet / exec / logs | Control plane | Worker nodes | 10250 |
+| Port-forward tunnels | Control plane | Worker nodes | 1025–65535 |
+| Node-to-node (pod mesh) | Node SG | Node SG | All |
+| Outbound (ECR, AWS APIs) | Worker nodes | NAT Gateway | All |
 
 ---
 
 ## Prerequisites
 
-| Tool | Version |
-| --- | --- |
-| Terraform | >= 1.14.7 |
-| AWS CLI | >= 2.x |
-| kubectl | >= 1.30 |
+### Tools
 
-You will also need:
+| Tool | Minimum version | Install |
+| --- | --- | --- |
+| Terraform | >= 1.14.7 | [terraform.io/downloads](https://developer.hashicorp.com/terraform/install) |
+| AWS CLI | >= 2.x | [aws.amazon.com/cli](https://aws.amazon.com/cli/) |
+| kubectl | >= 1.30 | [kubernetes.io/docs](https://kubernetes.io/docs/tasks/tools/) |
+| Git | any | [git-scm.com](https://git-scm.com/) |
 
-- An AWS account with permissions to create VPC, EKS, IAM, and S3 resources
-- An S3 bucket named `eks-iac-tf-state` in `ca-central-1`
-- A DynamoDB table named `terraform-state-lock` with partition key `LockID` (String)
+### AWS resources (one-time setup, outside Terraform)
+
+These must exist before the first `terraform init`. Create them once per AWS account:
+
+```bash
+# 1. S3 bucket for Terraform state (versioning + encryption recommended)
+aws s3api create-bucket \
+  --bucket eks-iac-tf-state \
+  --region ca-central-1 \
+  --create-bucket-configuration LocationConstraint=ca-central-1
+
+aws s3api put-bucket-versioning \
+  --bucket eks-iac-tf-state \
+  --versioning-configuration Status=Enabled
+
+# 2. DynamoDB table for state locking
+aws dynamodb create-table \
+  --table-name terraform-state-lock \
+  --attribute-definitions AttributeName=LockID,AttributeType=S \
+  --key-schema AttributeName=LockID,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST \
+  --region ca-central-1
+```
+
+### AWS credentials
+
+Configure credentials locally before running any Terraform command:
+
+```bash
+aws configure
+# AWS Access Key ID:     <your key>
+# AWS Secret Access Key: <your secret>
+# Default region:        ca-central-1
+# Default output format: json
+```
 
 ---
 
-## Deployment
+## Repository Structure
 
-### Local deployment
+```text
+eks-iac-pipeline/
+│
+├── main.tf            # Root: wires the VPC and EKS modules together
+├── variables.tf       # Root variable declarations
+├── outputs.tf         # Surfaces cluster endpoint, VPC ID, OIDC ARN, etc.
+├── provider.tf        # AWS + TLS provider versions (>= 1.14.7)
+├── backend.tf         # S3 remote state + DynamoDB lock configuration
+├── dev.tfvars         # Variable values for the dev environment
+│
+├── modules/
+│   │
+│   ├── vpc/
+│   │   ├── main.tf        # VPC, IGW, public/private subnets, NAT Gateway,
+│   │   │                  # route tables, Kubernetes subnet tags
+│   │   ├── variable.tf    # name, vpc_cidr, AZs, subnet CIDRs, cluster_name, …
+│   │   └── output.tf      # vpc_id, subnet ID maps and lists, NAT IP, …
+│   │
+│   └── eks/
+│       ├── main.tf        # EKS cluster, managed node group, IAM roles,
+│       │                  # security groups, OIDC provider
+│       ├── variable.tf    # name, subnet_ids, version, node sizing, …
+│       └── output.tf      # cluster_name, endpoint, CA data, OIDC ARN, …
+│
+└── .github/
+    └── workflows/
+        ├── validate.yaml  # Automatic CI on every push and PR
+        └── terraform.yml  # Manual apply / destroy via workflow_dispatch
+```
+
+**Key relationships:**
+
+- `main.tf` calls `module.vpc` first, then passes `module.vpc.vpc_id` and `module.vpc.private_subnet_ids_list` into `module.eks`
+- The EKS module depends on the VPC module via an explicit `depends_on`
+- Both modules expose outputs that are re-exported by the root `outputs.tf`
+
+---
+
+## Running Locally
+
+### 1. Clone and initialise
 
 ```bash
-# 1. Clone the repository
 git clone https://github.com/<your-username>/eks-iac-pipeline.git
 cd eks-iac-pipeline
 
-# 2. Configure AWS credentials
-aws configure
-
-# 3. Initialize Terraform (connects to S3 backend)
+# Downloads providers (hashicorp/aws, hashicorp/tls) and connects to S3 backend
 terraform init
-
-# 4. Preview what will be created
-terraform plan -var-file=dev.tfvars
-
-# 5. Apply
-terraform apply -var-file=dev.tfvars
-
-# 6. Configure kubectl
-aws eks update-kubeconfig --region ca-central-1 --name eks-iac-pipeline
-
-# 7. Verify nodes are ready
-kubectl get nodes
 ```
 
-### CI deployment (GitHub Actions)
-
-1. Fork or push the repository to GitHub.
-2. Add two repository secrets under **Settings → Secrets and variables → Actions**:
-   - `AWS_ACCESS_KEY_ID`
-   - `AWS_SECRET_ACCESS_KEY`
-3. Every push will automatically run the quality gate (`fmt → validate → plan`).
-4. To apply, go to **Actions → EKS-Creation-Using-Terraform → Run workflow** and select `apply`.
-
-### Teardown
+### 2. Review the plan
 
 ```bash
-# Local
-terraform destroy -var-file=dev.tfvars
+terraform plan -var-file=dev.tfvars
+```
 
-# Or via GitHub Actions -> Run workflow -> select 'destroy'
+The plan shows every resource that will be created. Review it carefully — especially IAM roles and security group rules — before applying.
+
+### 3. Apply
+
+```bash
+terraform apply -var-file=dev.tfvars
+```
+
+Provisioning takes approximately 15–20 minutes. EKS control plane creation accounts for most of that time.
+
+### 4. Connect kubectl
+
+```bash
+aws eks update-kubeconfig \
+  --region ca-central-1 \
+  --name eks-iac-pipeline
+```
+
+### 5. Verify the cluster
+
+```bash
+# All nodes should show STATUS=Ready
+kubectl get nodes
+
+# Check the cluster info
+kubectl cluster-info
+
+# View outputs (endpoint, OIDC ARN, subnet IDs, etc.)
+terraform output
 ```
 
 ---
 
-## Key Design Decisions
+## CI/CD Pipeline
 
-**Private nodes, public NAT** — worker nodes have no public IP. All outbound traffic (ECR image pulls, AWS API calls) routes through a NAT Gateway in the public subnet. This is the standard production pattern for EKS.
+Two workflows cover the full lifecycle from code review to production deployment.
 
-**Managed node group over self-managed** — AWS handles node patching, AMI updates, and graceful draining. The `desired_size` is ignored by Terraform after initial creation so the Cluster Autoscaler can manage node count freely.
+### Automatic quality gate — `validate.yaml`
 
-**OIDC provider included** — the OIDC provider is provisioned alongside the cluster so IRSA is available immediately. This is a prerequisite for any AWS-integrated Kubernetes add-on.
+**Triggers:** every `git push` to any branch, and every pull request.
 
-**`for_each` over `count` in modules** — subnets are keyed by availability zone name, not by index. This means adding or removing an AZ only affects that subnet's resource, not every subsequent one.
+```text
+  push  ──────────────────────────────────────────────────────► branch check
+  PR    ──────────────────────────────────────────────────────► PR check + comment
 
-**Remote state with locking** — S3 + DynamoDB prevents two engineers (or two CI runs) from applying simultaneously and corrupting state.
+  Step 1   terraform init       Connects to S3 backend, downloads providers
+  Step 2   terraform fmt -check Fails if any file is not canonical format
+  Step 3   terraform validate   Type-checks config; no AWS calls made
+  Step 4   terraform plan       Full plan against real AWS state
+  Step 5   Post PR comment      (PR events only) Pastes plan output into PR thread
+```
 
----
+The plan step uses `continue-on-error: true` so the PR comment always posts, even when the plan itself fails. A final `exit 1` step then marks the job red. This ensures reviewers always see the plan output regardless of whether it succeeded.
 
-## Estimated Cost (dev environment, 1 hour)
+**No apply ever happens from this workflow.**
 
-| Resource | Cost |
+### Manual apply / destroy — `terraform.yml`
+
+**Trigger:** manually from **Actions → EKS-Creation-Using-Terraform → Run workflow**.
+
+Inputs:
+
+| Input | Options | Default |
+| --- | --- | --- |
+| `tfvars_file` | any path | `dev.tfvars` |
+| `action` | `plan` `apply` `destroy` | `apply` |
+
+This workflow is the only path to running `apply` or `destroy` from CI. It uses a `production` GitHub environment, meaning any protection rules you configure (required reviewers, deployment branch policies) must be satisfied before the workflow proceeds.
+
+### Required GitHub secrets
+
+Add these under **Repository Settings → Secrets and variables → Actions → New repository secret**:
+
+| Secret | Description |
 | --- | --- |
-| EKS control plane | $0.10 |
-| 2x t3.medium nodes | $0.09 |
-| NAT Gateway + data | $0.09 |
-| EBS volumes (40 GiB) | $0.01 |
-| **Total** | **~$0.29 USD** |
+| `AWS_ACCESS_KEY_ID` | Access key ID for the CI IAM user |
+| `AWS_SECRET_ACCESS_KEY` | Secret access key for the CI IAM user |
+
+The CI IAM user needs the following minimum permissions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject", "s3:PutObject", "s3:DeleteObject",
+        "s3:ListBucket", "s3:HeadObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::eks-iac-tf-state",
+        "arn:aws:s3:::eks-iac-tf-state/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem", "dynamodb:PutItem",
+        "dynamodb:DeleteItem", "dynamodb:DescribeTable"
+      ],
+      "Resource": "arn:aws:dynamodb:ca-central-1:*:table/terraform-state-lock"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ec2:Describe*", "eks:Describe*", "eks:List*",
+        "iam:Get*", "iam:List*"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
 
 ---
 
-## Future Improvements
+## Environment Separation
 
-- [ ] Add VPC endpoints for ECR, S3, and EKS to eliminate NAT Gateway cost in production
-- [ ] Enable KMS envelope encryption for Kubernetes secrets
-- [ ] Add per-AZ NAT Gateways for high availability
-- [ ] Deploy the AWS Load Balancer Controller as a Helm release
-- [ ] Add the Cluster Autoscaler
-- [ ] Restrict `cluster_endpoint_public_access_cidrs` to known CIDRs
-- [ ] Add tflint and checkov to the CI pipeline for deeper static analysis
+Infrastructure values are passed through `.tfvars` files — one per environment. The Terraform code itself is environment-agnostic.
+
+### Current environments
+
+| File | Environment | Region | Notes |
+| --- | --- | --- | --- |
+| `dev.tfvars` | dev | ca-central-1 | Single NAT Gateway, t3.medium nodes |
+
+### Adding a production environment
+
+1. Create `prod.tfvars` at the repo root (it is gitignored by default — keep it that way for prod since it may contain sensitive values, or store it as a GitHub secret):
+
+```hcl
+env          = "prod"
+aws_region   = "ca-central-1"
+project_name = "eks-iac-pipeline"
+
+tf_state_bucket     = "eks-iac-tf-state"
+tf_state_lock_table = "terraform-state-lock"
+
+aws_subnet-1          = "ca-central-1a"
+aws_subnet-2          = "ca-central-1b"
+public_subnet_cidr_1  = "10.1.1.0/24"
+public_subnet_cidr_2  = "10.1.2.0/24"
+private_subnet_cidr_1 = "10.1.10.0/24"
+private_subnet_cidr_2 = "10.1.11.0/24"
+
+enable_nat_gateway      = true
+map_public_ip_on_launch = false
+```
+
+1. Update `backend.tf` to use a separate state key for production (or a separate bucket):
+
+```hcl
+backend "s3" {
+  key = "eks/prod/terraform.tfstate"   # separate key per environment
+}
+```
+
+1. Trigger the manual workflow with `tfvars_file = prod.tfvars`.
+
+### What changes between environments
+
+| Setting | dev | prod (recommended) |
+| --- | --- | --- |
+| Node instance type | t3.medium | m5.large or larger |
+| Node min/max | 1 / 3 | 2 / 10 |
+| NAT Gateways | 1 (single AZ) | 1 per AZ (HA) |
+| Cluster logs | api, audit, authenticator | all five log types |
+| State key | `eks/terraform.tfstate` | `eks/prod/terraform.tfstate` |
+| GitHub environment | — | `production` with required reviewers |
 
 ---
 
+## Destroying Infrastructure
+
+> **Warning:** `terraform destroy` is irreversible. All cluster workloads, persistent volumes, and load balancers will be deleted. Ensure you have no data you need to preserve before proceeding.
+
+### Via GitHub Actions (recommended)
+
+1. Go to **Actions → EKS-Creation-Using-Terraform → Run workflow**
+2. Set `action` to `destroy` and `tfvars_file` to the environment you want to tear down
+3. Confirm the workflow completes successfully
+
+### Locally
+
+```bash
+# Preview what will be deleted
+terraform plan -destroy -var-file=dev.tfvars
+
+# Destroy (requires typing 'yes' to confirm)
+terraform destroy -var-file=dev.tfvars
+```
+
+After destroy, the S3 state file and DynamoDB lock table are left in place intentionally — they are cheap to keep and allow you to re-provision from scratch without re-running the one-time setup.
+
+---
+
+## Design Decisions
+
+**Private nodes, public NAT** — worker nodes have no public IP. All outbound traffic routes through a NAT Gateway in the public subnet. This is the standard AWS production pattern: nodes are unreachable from the internet, but can reach ECR, the EKS control plane, and AWS APIs.
+
+**Managed node group** — AWS handles AMI selection, node patching, and graceful cordon/drain during updates. The `desired_size` is excluded from Terraform's lifecycle so the Cluster Autoscaler can manage node count without Terraform fighting it on every plan.
+
+**OIDC provider at creation time** — the OIDC identity provider is provisioned alongside the cluster. Without it, Kubernetes workloads cannot assume IAM roles (IRSA), which blocks the AWS Load Balancer Controller, Cluster Autoscaler, external-dns, and Secrets Manager integration.
+
+**`for_each` over `count` for subnets** — subnets are keyed by AZ name rather than index. Adding or removing an AZ only affects that one subnet in state — `count` would re-number everything after it, causing unnecessary replacements.
+
+**Kubernetes subnet tags** — both subnet tiers are tagged with `kubernetes.io/cluster/<name>` and either `kubernetes.io/role/elb` or `kubernetes.io/role/internal-elb`. These tags are required by the AWS Load Balancer Controller to discover where to place ALBs and NLBs.
+
+**Remote state with locking** — S3 + DynamoDB prevents two concurrent applies from corrupting state. The state file is encrypted at rest. This setup is a prerequisite for any team or CI-based workflow.
+
+---
+
+## Cost Estimate
+
+Running the full dev stack for one hour in `ca-central-1`:
+
+| Resource | Rate | 1 hour |
+| --- | --- | --- |
+| EKS control plane | $0.10 / hr | $0.10 |
+| 2x EC2 t3.medium (ON_DEMAND) | $0.0464 / hr each | $0.09 |
+| NAT Gateway | $0.059 / hr + $0.059 / GB | ~$0.09 |
+| EBS gp2 — 20 GiB x2 nodes | $0.114 / GB-month | $0.01 |
+| CloudWatch Logs (api, audit) | $0.57 / GB ingested | < $0.01 |
+| **Total** | | **~$0.29 USD** |
+
+The cluster takes ~15–20 minutes to provision, so your usable window within a 1-hour session is approximately 40 minutes. Tear it down promptly to avoid billing into a second hour.
+
+---
+
+## Roadmap
+
+- [ ] VPC endpoints for ECR, S3, and EKS — eliminate NAT Gateway cost and reduce blast radius
+- [ ] KMS envelope encryption for Kubernetes Secrets
+- [ ] Per-AZ NAT Gateways for production high availability
+- [ ] AWS Load Balancer Controller deployment via Helm
+- [ ] Cluster Autoscaler deployment via Helm
+- [ ] Restrict `cluster_endpoint_public_access_cidrs` to known office/VPN CIDRs
+- [ ] Add tflint and checkov to the CI pipeline for policy-as-code enforcement
+- [ ] OIDC-based GitHub Actions authentication (eliminate long-lived IAM credentials)
